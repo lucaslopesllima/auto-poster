@@ -83,6 +83,13 @@ MIGRATIONS = [
     "ALTER TABLE posts ADD COLUMN repeat_minutes INTEGER",
     "ALTER TABLE posts ADD COLUMN repeat_daily_at TEXT",
     "ALTER TABLE posts ADD COLUMN is_draft INTEGER DEFAULT 0",
+    # Avaliação automática do agente crítico.
+    "ALTER TABLE posts ADD COLUMN eval_score REAL",
+    "ALTER TABLE posts ADD COLUMN eval_comment TEXT",
+    "ALTER TABLE posts ADD COLUMN eval_at TEXT",
+    # Contexto da geração — usado para regenerar com feedback do agente.
+    "ALTER TABLE posts ADD COLUMN source_topic TEXT",
+    "ALTER TABLE posts ADD COLUMN source_articles TEXT",  # JSON list[dict]
     # Dedup global de notícias: deduplica registros legados (UNIQUE
     # composto antigo permitia mesma url em jobs distintos) e cria índice
     # único global em url_hash.
@@ -178,6 +185,8 @@ def add_post(
     repeat_minutes: Optional[int] = None,
     repeat_daily_at: Optional[str] = None,
     is_draft: bool = False,
+    source_topic: Optional[str] = None,
+    source_articles: Optional[list] = None,
 ) -> int:
     """
     Insere um post na fila. Devolve o id gerado.
@@ -185,6 +194,9 @@ def add_post(
     Recorrência (mutuamente exclusivas):
       - repeat_minutes: re-publica a cada N minutos após cada postagem
       - repeat_daily_at: re-publica diariamente no horário 'HH:MM' (local)
+
+    `source_topic` e `source_articles` (lista de dicts) guardam o contexto
+    de geração para permitir regenerar o post com feedback do avaliador.
     """
     if repeat_minutes is not None and repeat_daily_at:
         raise ValueError("use repeat_minutes OU repeat_daily_at, não ambos")
@@ -197,11 +209,16 @@ def add_post(
         scheduled_at = _next_daily_iso(daily)
 
     when_iso = parse_when(scheduled_at)
+    import json as _json
+    arts_json = _json.dumps(source_articles) if source_articles else None
     with connect() as conn:
         cur = conn.execute(
-            "INSERT INTO posts (text, image_path, scheduled_at, repeat_minutes, repeat_daily_at, is_draft) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (text, image_path, when_iso, repeat_minutes, daily, 1 if is_draft else 0),
+            "INSERT INTO posts (text, image_path, scheduled_at, "
+            "repeat_minutes, repeat_daily_at, is_draft, "
+            "source_topic, source_articles) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (text, image_path, when_iso, repeat_minutes, daily,
+             1 if is_draft else 0, source_topic, arts_json),
         )
         return cur.lastrowid
 
@@ -227,7 +244,62 @@ def update_text(post_id: int, text: str) -> int:
 _POST_EDITABLE = {
     "text", "image_path", "scheduled_at",
     "repeat_minutes", "repeat_daily_at", "is_draft",
+    "eval_score", "eval_comment", "eval_at",
 }
+
+
+def set_evaluation(post_id: int, score: float, comment: str) -> int:
+    """Persiste a nota e o comentário do agente avaliador."""
+    with connect() as conn:
+        cur = conn.execute(
+            "UPDATE posts SET eval_score = ?, eval_comment = ?, eval_at = ? "
+            "WHERE id = ?",
+            (float(score), comment or "", _now_iso(), post_id),
+        )
+        return cur.rowcount
+
+
+def clear_evaluation(post_id: int) -> int:
+    """Zera a avaliação — usado após regerar o texto, para reavaliar."""
+    with connect() as conn:
+        cur = conn.execute(
+            "UPDATE posts SET eval_score = NULL, eval_comment = NULL, "
+            "eval_at = NULL WHERE id = ?",
+            (post_id,),
+        )
+        return cur.rowcount
+
+
+def fetch_unevaluated_drafts() -> list[sqlite3.Row]:
+    """Rascunhos pendentes (não publicados, não aprovados) sem avaliação."""
+    with connect() as conn:
+        return list(
+            conn.execute(
+                """
+                SELECT * FROM posts
+                WHERE posted_at IS NULL
+                  AND is_draft = 1
+                  AND eval_score IS NULL
+                ORDER BY created_at ASC
+                """
+            )
+        )
+
+
+def get_source_articles(post_id: int) -> list[dict]:
+    """Decodifica `source_articles` JSON do post. Lista vazia se ausente."""
+    import json as _json
+    row = get_post(post_id)
+    if row is None:
+        return []
+    keys = row.keys() if hasattr(row, "keys") else []
+    if "source_articles" not in keys or not row["source_articles"]:
+        return []
+    try:
+        data = _json.loads(row["source_articles"])
+        return data if isinstance(data, list) else []
+    except (ValueError, TypeError):
+        return []
 
 
 def update_post(post_id: int, **fields) -> int:

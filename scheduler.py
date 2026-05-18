@@ -25,6 +25,7 @@ import time
 from datetime import datetime
 
 import db
+import evaluator
 from linkedin_client import LinkedInClient, LinkedInError
 
 
@@ -38,8 +39,33 @@ def _handle_signal(signum, frame) -> None:  # noqa: ARG001
     print("\nEncerrando após o ciclo atual...")
 
 
+def _evaluate_tick() -> tuple[int, int]:
+    """Avalia rascunhos pendentes sem nota. Devolve (avaliados, falhas)."""
+    drafts = db.fetch_unevaluated_drafts()
+    if not drafts:
+        return 0, 0
+    ok = fail = 0
+    for row in drafts:
+        pid = row["id"]
+        try:
+            arts = db.get_source_articles(pid)
+            keys = row.keys() if hasattr(row, "keys") else []
+            topic = row["source_topic"] if "source_topic" in keys else None
+            ev = evaluator.evaluate_post(
+                row["text"] or "", topic=topic, articles=arts or None,
+            )
+            db.set_evaluation(pid, ev.score, ev.comment)
+            ok += 1
+            print(f"  ⓘ #{pid} avaliado → {ev.score:.1f}")
+        except evaluator.EvaluationError as exc:
+            fail += 1
+            print(f"  ✗ #{pid} avaliação falhou: {exc}", file=sys.stderr)
+    return ok, fail
+
+
 def _tick(client: LinkedInClient) -> tuple[int, int]:
     """Executa um ciclo. Devolve (publicados, falhas)."""
+    _evaluate_tick()
     rows = db.fetch_due()
     if not rows:
         return 0, 0

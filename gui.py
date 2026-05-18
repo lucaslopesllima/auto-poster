@@ -28,6 +28,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 import auth as auth_module
 import composer
 import db
+import evaluator
 import news
 from linkedin_client import LinkedInClient, LinkedInError
 
@@ -261,18 +262,48 @@ class SchedulerThread:
                         fail += 1
 
             jobs_run, jobs_err = self._process_jobs()
+            evals_ok, evals_err = self._evaluate_drafts()
 
             self.on_tick({
                 "ok": ok,
                 "fail": fail,
                 "jobs_run": jobs_run,
                 "jobs_err": jobs_err,
+                "evals_ok": evals_ok,
+                "evals_err": evals_err,
                 "last_tick": datetime.now(timezone.utc).isoformat(),
             })
             slept = 0
             while slept < self.interval and not self._stop.is_set():
                 time.sleep(1)
                 slept += 1
+
+    def _evaluate_drafts(self) -> tuple[int, int]:
+        """Avalia rascunhos pendentes sem nota. Devolve (ok, falhas)."""
+        ok = fail = 0
+        for row in db.fetch_unevaluated_drafts():
+            pid = row["id"]
+            try:
+                arts = db.get_source_articles(pid)
+                keys = row.keys() if hasattr(row, "keys") else []
+                topic = row["source_topic"] if "source_topic" in keys else None
+                ev = evaluator.evaluate_post(
+                    row["text"] or "", topic=topic, articles=arts or None,
+                )
+                db.set_evaluation(pid, ev.score, ev.comment)
+                print(
+                    f"[eval] post #{pid} score={ev.score:.1f} "
+                    f"comment={ev.comment[:80]!r}",
+                    flush=True,
+                )
+                ok += 1
+            except evaluator.EvaluationError as exc:
+                print(f"[eval] post #{pid} FAIL: {exc}", flush=True)
+                fail += 1
+            except Exception as exc:  # noqa: BLE001
+                print(f"[eval] post #{pid} ERRO: {exc}", flush=True)
+                fail += 1
+        return ok, fail
 
     def _process_jobs(self) -> tuple[int, int]:
         """
@@ -333,6 +364,7 @@ class SchedulerThread:
             pid = db.add_post(
                 text=text, image_path=image_path,
                 scheduled_at=None, is_draft=True,
+                source_topic=topic, source_articles=fresh_arts,
             )
             # job_id guardado só para auditoria; lookup é por url_hash global.
             db.mark_articles_used(jid, fresh_arts)
@@ -645,10 +677,62 @@ class EditPostDialog(QtWidgets.QDialog):
     def __init__(self, parent, row):
         super().__init__(parent)
         self.setWindowTitle(f"Editar post #{row['id']}")
-        self.resize(640, 540)
+        self.resize(640, 640)
         self._row = row
+        self._post_id = row["id"]
 
         layout = QtWidgets.QVBoxLayout(self)
+
+        # --- avaliação do agente (se houver) + botão de regerar
+        keys = row.keys() if hasattr(row, "keys") else []
+        has_score = ("eval_score" in keys) and (row["eval_score"] is not None)
+        has_source = ("source_articles" in keys) and bool(row["source_articles"])
+        eval_box = QtWidgets.QFrame()
+        eval_box.setObjectName("card")
+        ev_l = QtWidgets.QVBoxLayout(eval_box)
+        header = QtWidgets.QHBoxLayout()
+        title_lbl = QtWidgets.QLabel("Avaliação do agente")
+        title_lbl.setObjectName("muted")
+        header.addWidget(title_lbl)
+        header.addStretch(1)
+        self.score_lbl = QtWidgets.QLabel("(ainda não avaliado)")
+        if has_score:
+            sc = float(row["eval_score"])
+            self.score_lbl.setText(f"Nota: {sc:.1f} / 10")
+            if sc < 5:
+                self.score_lbl.setStyleSheet("color:#fca5a5;font-weight:600;")
+            elif sc < 7:
+                self.score_lbl.setStyleSheet("color:#fcd34d;font-weight:600;")
+            else:
+                self.score_lbl.setStyleSheet("color:#4ade80;font-weight:600;")
+        header.addWidget(self.score_lbl)
+        ev_l.addLayout(header)
+        self.eval_comment = QtWidgets.QPlainTextEdit()
+        self.eval_comment.setReadOnly(True)
+        self.eval_comment.setPlainText(
+            (row["eval_comment"] if "eval_comment" in keys else "") or ""
+        )
+        self.eval_comment.setMaximumHeight(80)
+        self.eval_comment.setPlaceholderText(
+            "(o agente avaliador escreve aqui o que melhorar)"
+        )
+        ev_l.addWidget(self.eval_comment)
+        regen_row = QtWidgets.QHBoxLayout()
+        self.regen_btn = QtWidgets.QPushButton(
+            "Regerar com feedback do agente"
+            + (" + notícias" if has_source else "")
+        )
+        self.regen_btn.setObjectName("primary")
+        self.regen_btn.setEnabled(
+            has_score and bool((row["eval_comment"] or "").strip())
+        )
+        self.regen_btn.clicked.connect(self._regenerate)
+        regen_row.addWidget(self.regen_btn)
+        self.regen_status = QtWidgets.QLabel("")
+        self.regen_status.setObjectName("muted")
+        regen_row.addWidget(self.regen_status, 1)
+        ev_l.addLayout(regen_row)
+        layout.addWidget(eval_box)
 
         layout.addWidget(QtWidgets.QLabel("Texto:"))
         self.text_edit = QtWidgets.QPlainTextEdit()
@@ -754,6 +838,51 @@ class EditPostDialog(QtWidgets.QDialog):
         if path:
             self.image_path.setText(path)
 
+    def _regenerate(self) -> None:
+        """Manda composer reescrever o post com o feedback do avaliador."""
+        comment = self.eval_comment.toPlainText().strip()
+        if not comment:
+            self.regen_status.setText("Sem comentário do avaliador.")
+            return
+        previous = self.text_edit.toPlainText().strip()
+        if not previous:
+            self.regen_status.setText("Texto vazio.")
+            return
+
+        # carrega tópico + notícias originais do banco (se houver)
+        articles = db.get_source_articles(self._post_id)
+        row = db.get_post(self._post_id)
+        keys = row.keys() if (row and hasattr(row, "keys")) else []
+        topic = row["source_topic"] if (row and "source_topic" in keys) else None
+
+        self.regen_btn.setEnabled(False)
+        self.regen_status.setText("Regerando...")
+
+        def job():
+            return composer.regenerate_post(
+                topic=topic,
+                articles=articles or None,
+                previous_text=previous,
+                evaluation_comment=comment,
+            )
+
+        def done(new_text: str):
+            self.text_edit.setPlainText(new_text)
+            # Limpa a avaliação anterior: o agente reavalia no próximo tick.
+            db.clear_evaluation(self._post_id)
+            self.score_lbl.setText("(reavaliação pendente)")
+            self.score_lbl.setStyleSheet("color:#93c5fd;")
+            self.eval_comment.clear()
+            self.regen_btn.setEnabled(False)
+            self.regen_status.setText("Texto regerado. Salve para aplicar.")
+
+        def err(tb: str):
+            self.regen_btn.setEnabled(True)
+            self.regen_status.setText(tb.splitlines()[-1])
+            print(tb, flush=True)
+
+        run_in_thread(self, job, on_done=done, on_error=err)
+
     def values(self) -> dict:
         out: dict = {
             "text": self.text_edit.toPlainText().strip(),
@@ -811,21 +940,22 @@ class QueueTab(QtWidgets.QWidget):
         layout.addLayout(msg_row)
 
         self._busy = False
-        self.table = QtWidgets.QTableWidget(0, 8)
+        self.table = QtWidgets.QTableWidget(0, 9)
         self.table.setHorizontalHeaderLabels([
-            "#", "Status", "Agendado", "Repete", "Texto", "Img", "Ações", "Erro"
+            "#", "Status", "Nota", "Agendado", "Repete", "Texto", "Img",
+            "Ações", "Erro",
         ])
         self.table.horizontalHeader().setStretchLastSection(False)
         self.table.horizontalHeader().setSectionResizeMode(
-            4, QtWidgets.QHeaderView.Stretch
+            5, QtWidgets.QHeaderView.Stretch
         )
         self.table.horizontalHeader().setSectionResizeMode(
-            7, QtWidgets.QHeaderView.Stretch
+            8, QtWidgets.QHeaderView.Stretch
         )
         self.table.horizontalHeader().setSectionResizeMode(
-            6, QtWidgets.QHeaderView.Fixed
+            7, QtWidgets.QHeaderView.Fixed
         )
-        self.table.setColumnWidth(6, 280)
+        self.table.setColumnWidth(7, 280)
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(44)
         self.table.setEditTriggers(QtWidgets.QTableWidget.NoEditTriggers)
@@ -851,19 +981,41 @@ class QueueTab(QtWidgets.QWidget):
             self.table.insertRow(i)
             self.table.setItem(i, 0, QtWidgets.QTableWidgetItem(f"#{r['id']}"))
             self.table.setItem(i, 1, QtWidgets.QTableWidgetItem(status))
-            self.table.setItem(i, 2, QtWidgets.QTableWidgetItem(_fmt_sched_br(r["scheduled_at"])))
+            # Nota do agente avaliador (0-10) — vazio enquanto não avaliado
+            score_txt = ""
+            score_color: Optional[QtGui.QColor] = None
+            if "eval_score" in keys and r["eval_score"] is not None:
+                try:
+                    sc = float(r["eval_score"])
+                    score_txt = f"{sc:.1f}"
+                    if sc < 5:
+                        score_color = QtGui.QColor("#fca5a5")
+                    elif sc < 7:
+                        score_color = QtGui.QColor("#fcd34d")
+                    else:
+                        score_color = QtGui.QColor("#4ade80")
+                except (TypeError, ValueError):
+                    score_txt = ""
+            elif status in ("rascunho",):
+                score_txt = "…"  # ainda na fila do avaliador
+            score_item = QtWidgets.QTableWidgetItem(score_txt)
+            if score_color is not None:
+                score_item.setForeground(score_color)
+            if "eval_comment" in keys and r["eval_comment"]:
+                score_item.setToolTip(r["eval_comment"])
+            self.table.setItem(i, 2, score_item)
+            self.table.setItem(i, 3, QtWidgets.QTableWidgetItem(_fmt_sched_br(r["scheduled_at"])))
             repeat_str = ""
-            keys = r.keys() if hasattr(r, "keys") else []
             if "repeat_daily_at" in keys and r["repeat_daily_at"]:
                 repeat_str = f"diário {r['repeat_daily_at']}"
             elif "repeat_minutes" in keys and r["repeat_minutes"]:
                 repeat_str = f"a cada {r['repeat_minutes']}min"
-            self.table.setItem(i, 3, QtWidgets.QTableWidgetItem(repeat_str))
+            self.table.setItem(i, 4, QtWidgets.QTableWidgetItem(repeat_str))
             snippet = (r["text"] or "").replace("\n", " ")[:80]
             text_item = QtWidgets.QTableWidgetItem(snippet)
             text_item.setToolTip(r["text"] or "")
-            self.table.setItem(i, 4, text_item)
-            self.table.setItem(i, 5, QtWidgets.QTableWidgetItem("✓" if r["image_path"] else ""))
+            self.table.setItem(i, 5, text_item)
+            self.table.setItem(i, 6, QtWidgets.QTableWidgetItem("✓" if r["image_path"] else ""))
             # ações
             actions = QtWidgets.QWidget()
             ah = QtWidgets.QHBoxLayout(actions)
@@ -898,16 +1050,17 @@ class QueueTab(QtWidgets.QWidget):
             b_del.clicked.connect(lambda _=False, pid=r["id"]: self.delete_one(pid))
             ah.addWidget(self._size_btn(b_del, 70))
 
-            self.table.setCellWidget(i, 6, actions)
+            self.table.setCellWidget(i, 7, actions)
             err_item = QtWidgets.QTableWidgetItem(r["error"] or "")
             if r["error"]:
                 err_item.setForeground(QtGui.QColor("#fca5a5"))
-            self.table.setItem(i, 7, err_item)
+            self.table.setItem(i, 8, err_item)
         self.table.resizeColumnToContents(0)
         self.table.resizeColumnToContents(1)
         self.table.resizeColumnToContents(2)
         self.table.resizeColumnToContents(3)
-        self.table.resizeColumnToContents(5)
+        self.table.resizeColumnToContents(4)
+        self.table.resizeColumnToContents(6)
 
     # ---- ações
     def publish_one(self, post_id: int):
@@ -969,6 +1122,9 @@ class QueueTab(QtWidgets.QWidget):
         except ValueError as exc:
             self._set_msg("err", str(exc))
             return
+        # Se o texto mudou, joga fora a avaliação antiga — agente reavalia.
+        if (vals.get("text") or "") != (row["text"] or ""):
+            db.clear_evaluation(post_id)
         self._set_msg("ok", f"Post #{post_id} atualizado.")
         self.refresh()
         self.queue_changed.emit()
@@ -1515,8 +1671,13 @@ class ResearchTab(QtWidgets.QWidget):
             self._set_msg("err", "Draft vazio.")
             return
         image = self._draft_image if self._draft_image and Path(self._draft_image).is_file() else None
+        topic = self.topic_edit.text().strip() or None
+        arts = list(self._articles) if self._articles else None
         try:
-            post_id = db.add_post(text=text, image_path=image, is_draft=True)
+            post_id = db.add_post(
+                text=text, image_path=image, is_draft=True,
+                source_topic=topic, source_articles=arts,
+            )
         except ValueError as exc:
             self._set_msg("err", str(exc))
             return
@@ -1850,10 +2011,15 @@ class MainWindow(QtWidgets.QMainWindow):
         parts = [f"{d.get('ok', 0)} pub", f"{d.get('fail', 0)} falha(s)"]
         if d.get("jobs_run") or d.get("jobs_err"):
             parts.append(f"jobs: {d.get('jobs_run', 0)} ok / {d.get('jobs_err', 0)} falha(s)")
+        if d.get("evals_ok") or d.get("evals_err"):
+            parts.append(
+                f"avaliações: {d.get('evals_ok', 0)} ok / "
+                f"{d.get('evals_err', 0)} falha(s)"
+            )
         self.statusBar().showMessage(
             f"último ciclo {d.get('last_tick', '')}: " + " · ".join(parts)
         )
-        if d.get("jobs_run"):
+        if d.get("jobs_run") or d.get("evals_ok"):
             self.research.jobs.refresh_jobs()
             self.queue.refresh()
 
